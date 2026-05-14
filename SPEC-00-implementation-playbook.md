@@ -192,3 +192,139 @@ Anything less is in-progress. There is no "good enough."
 - Claude session losing thread: split the work smaller; one spec section per turn.
 
 The specs are dense on purpose. The density is what keeps a multi-month, multi-engineer, AI-assisted build coherent. Trust the gates.
+
+---
+
+## 8. Appendix A — 3-Day Layer 1 Bootstrap
+
+The fastest path from empty repo to a deployed, gated foundation. This appendix is the **only** part of SPEC-00 that prescribes concrete commands; everything else in the spec set describes *what* to build, this describes *how to start*.
+
+### A.0 Prerequisites
+- **The user provides a throwaway AWS account** for testing. All deploys in this appendix target that account. Production accounts are out of scope until the system is built.
+- Local: Node 20+, pnpm 9+, AWS CLI v2, CDK v2, `jq`, `git`.
+- Set up:
+  ```
+  export AWS_PROFILE=skills-svc-throwaway
+  export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+  export CDK_DEFAULT_REGION=us-east-1
+  aws sts get-caller-identity   # confirm throwaway account
+  ```
+- One-time: `cdk bootstrap aws://${CDK_DEFAULT_ACCOUNT}/${CDK_DEFAULT_REGION}`.
+
+### A.1 Principles
+1. **Deploy to the throwaway account from hour 1.** Synth-only is a lie; half the bugs surface only at deploy.
+2. **Aspects and meta-tests before the resources they police.** Every subsequent commit is verified by construction.
+3. **Tight Claude loop.** `cdk synth --strict && pnpm -w test` is the feedback signal. Don't let Claude make more than 2–3 changes between gate runs.
+4. **No "tighten later."** SPEC-59 §1.1 scoping applies from the first IAM statement written.
+
+### A.2 Hour 1 — Repo skeleton + CI gates
+Workspace files: root `package.json` with pnpm workspaces, `tsconfig.base.json`, `pnpm-workspace.yaml`, `.github/workflows/ci.yml`.
+
+CI must, on every push, run:
+```
+pnpm -w install --frozen-lockfile
+pnpm -w typecheck
+pnpm -w test
+pnpm --filter @skills-svc/infra exec cdk synth --strict
+```
+Make this required before any other code lands.
+
+**Claude prompt:**
+> Scaffold a pnpm workspace with packages `@skills-svc/shared`, `@skills-svc/infra`, `@skills-svc/lambda`, `@skills-svc/ecs-runner`, `@skills-svc/cli`. Add `tsconfig.base.json` (strict, ES2022, NodeNext), per-package `tsconfig.json`, vitest config, and `.github/workflows/ci.yml` running the four gate commands above. No application code yet. Verify all four gates pass on an empty workspace.
+
+### A.3 Day 1 morning — Branded types (SPEC-34a) + aspects (SPEC-34b) + meta-tests
+Implement aspects **before** any resources. Write a meta-test stack that contains a deliberately bad construct (wildcard IAM, public subnet, unencrypted bucket) and assert each aspect rejects it.
+
+**Claude prompt:**
+> In `packages/shared/src/branded.ts`, implement branded types per SPEC-34a: `JobId`, `SkillId`, `CallerArn`, `UploadId`, `WorkflowId`. Each with a `make<X>` constructor that validates format and throws otherwise. Property tests in `packages/shared/src/__tests__/branded.property.ts` per SPEC-34c.
+>
+> In `packages/infra/lib/aspects/`, implement `NoWildcardIAMAspect`, `NoPublicSubnetAspect`, `KmsRequiredAspect`, `TlsOnlyAspect` per SPEC-34b. Default `strict: true` (no env override). Wildcard allowlist file `wildcard-allowlist.ts` with SIDs per SPEC-59 §1.2 exactly.
+>
+> In `packages/infra/test/aspects/`, write a meta-test that builds a deliberately bad stack (one wildcard IAM, one public subnet, one unencrypted bucket, one HTTP-only listener) and asserts each aspect fails synth. The test must pass — meaning the aspects must reject.
+
+Gate: `pnpm -w test && pnpm --filter @skills-svc/infra exec cdk synth --strict` green.
+
+### A.4 Day 1 afternoon — KMS keys + SSM exports (SPEC-01 §3)
+Stack `KmsStack` creates the nine keys named in SPEC-59 §1.1 footer (`UploadsKmsKey`, `ResultsKmsKey`, `EnvKmsKey`, `DdbKmsKey`, `SkillRegistryKmsKey`, `OpenSearchKmsKey`, `AuditKmsKey`, `LogsKmsKey`, `DLQKmsKey`). Each has rotation enabled, a key policy granting only the deploy account root + (later) specific service principals, and exports its ARN to SSM at `/skills-svc/${env}/kms/${purpose}/arn`.
+
+**Claude prompt:**
+> Implement `packages/infra/lib/stacks/kms-stack.ts` creating the nine KMS keys listed in SPEC-59 §1.1 footer. Each: customer-managed, rotation on, deletion window 30 days, alias `alias/skills-svc/${env}/${purpose}`, ARN exported to SSM at `/skills-svc/${env}/kms/${purpose}/arn`. Key policies grant only `kms:*` to the account root for now; service principals added in their respective stacks. Synth test asserts nine keys exist with rotation enabled.
+
+Deploy to the throwaway account: `cdk deploy SkillsSvc-Kms-dev`. Verify in console.
+
+### A.5 Day 2 morning — VPC + endpoints (SPEC-01 §4 + SPEC-51 + SPEC-59 §3)
+Single VPC, private isolated subnets only across 3 AZs, no NAT. Gateway endpoints for S3 and DDB. Interface endpoints for every service in SPEC-51 §2. Bedrock endpoint with the `AllowAnthropicAndTitanEmbed` + `DenyEverythingElse` policy SIDs per SPEC-59 §3.1.
+
+**Claude prompt:**
+> Implement `packages/infra/lib/stacks/network-stack.ts` per SPEC-01 §4 and SPEC-51:
+> - VPC: 3 AZs, private isolated subnets only (no NAT, no public subnets), `enableDnsHostnames` + `enableDnsSupport`
+> - Gateway endpoints: S3, DDB
+> - Interface endpoints: KMS, Secrets Manager, SSM, ECR-API, ECR-DKR, STS, SQS, Logs, Monitoring, OpenSearch, Bedrock-Runtime
+> - Bedrock-Runtime endpoint policy with `AllowAnthropicAndTitanEmbed` + `DenyEverythingElse` SIDs per SPEC-59 §3.1
+> - Each endpoint policy requires `aws:PrincipalAccount = this.account` and `aws:SecureTransport = true`
+> - Security groups: `lambdaSg`, `ecsTaskSg`, `bedrockEndpointSg` (allows 443 only from lambdaSg + ecsTaskSg)
+>
+> Synth tests per SPEC-59 §3.2 Check A (Bedrock endpoint shape) and SPEC-59 §4 (synth assertions for every endpoint).
+
+Deploy. Confirm endpoints created, policies attached.
+
+### A.6 Day 2 afternoon — IAM roles (SPEC-45 + SPEC-59 §1.1)
+Three roles: `UserRole` (assumed by CLI), `EcsTaskRole`, `McpLambdaRole`. Every KMS statement uses the literal SSM-resolved ARN, never `*`. Every Category B wildcard carries `aws:RequestedRegion` + namespace/tag conditions per SPEC-59 §1.2.
+
+**Claude prompt:**
+> Implement `packages/infra/lib/stacks/iam-stack.ts` per SPEC-45 with SPEC-59 §1.1 scoping applied from the first statement. For each of `UserRole`, `EcsTaskRole`, `McpLambdaRole`:
+> - Resolve KMS key ARNs via `ssm.StringParameter.valueFromLookup(...)` at synth (literal ARNs in template, not tokens)
+> - Every `kms:Decrypt`/`kms:GenerateDataKey` statement names specific keys, never `*`
+> - Every Category B statement (XRay, CW metrics, CT lookup, Comprehend PII, Bedrock list, EC2 describe) carries `aws:RequestedRegion` + namespace/tag conditions per SPEC-59 §1.2
+> - The aspect from §A.3 must pass — if it fails, fix the role, not the aspect
+>
+> Tests: `iam-resource-scope.test.ts` asserts no wildcards outside allowlist; `kms-key-scoping.test.ts` asserts literal ARN strings.
+
+Deploy. The aspect should pass on first synth; if it doesn't, the spec wasn't followed.
+
+### A.7 Day 3 morning — Buckets, DDB, OpenSearch (SPEC-01 §5 + SPEC-06)
+Four buckets (uploads, results, review-artifacts, audit-logs), one DDB table (single-table per SPEC-01 §5), one OpenSearch Serverless VECTOR collection. All KMS-encrypted with the right keys from §A.4. Bucket policies require `aws:SecureTransport: true` and `s3:x-amz-server-side-encryption: aws:kms`. Block-public-access on all buckets. DDB PITR on.
+
+**Claude prompt:**
+> Implement `packages/infra/lib/stacks/data-stack.ts` per SPEC-01 §5:
+> - Four S3 buckets each with the corresponding KMS key from KmsStack, block-public-access, TLS-only + KMS-required bucket policies, lifecycle rules per SPEC-06
+> - One DynamoDB table per SPEC-01 §5 single-table design, PITR on, KMS with DdbKmsKey, GSI1 (status) + GSI2 (user)
+> - One OpenSearch Serverless collection (VECTOR type) with the index template per SPEC-03, KMS with OpenSearchKmsKey, data access policy granting only EcsTaskRole + McpLambdaRole
+>
+> Tests: `bucket-policies.test.ts` asserts TLS + KMS conditions on every bucket; `ddb-pitr.test.ts` asserts PITR on; `opensearch-encryption.test.ts` asserts CMK encryption.
+
+### A.8 Day 3 afternoon — Hardening + Bedrock reachability probe
+SPEC-06: enable GuardDuty, Security Hub (with AWS Foundational + CIS standards), CloudTrail (organization trail not required for throwaway, account-level fine), AWS Config with the `bedrock-endpoint-policy-immutable` rule per SPEC-59 §3.3.
+
+Then run SPEC-59 §3.2 **Check B** post-deploy probe:
+- Probe 1: invoke `anthropic.claude-haiku-4-5-20251001` → succeeds
+- Probe 2: invoke `mistral.mixtral-8x7b-instruct-v0:1` → denied by endpoint policy
+- Probe 3: DNS resolution of `bedrock-runtime.${region}.amazonaws.com` from inside the VPC returns RFC1918 only
+
+**Claude prompt:**
+> Implement `packages/infra/lib/stacks/hardening-stack.ts` per SPEC-06: GuardDuty detector, Security Hub with AWS Foundational + CIS, account-level CloudTrail to the audit-logs bucket, AWS Config with the `bedrock-endpoint-policy-immutable` rule + auto-remediation Lambda per SPEC-59 §3.3.
+>
+> Then implement `packages/infra/test/post-deploy/bedrock-reachability.ts` as a one-shot Lambda placed in the VPC with lambdaSg, executing the three probes from SPEC-59 §3.2 Check B. The CodeBuild deploy step runs this Lambda after `cdk deploy` and rolls back if any probe fails.
+
+Deploy. **If Check B goes green, Layer 1 is real.** That is the line.
+
+### A.9 Layer 1 Acceptance Gate
+Before starting Layer 2, all of these must be true in the throwaway account:
+- [ ] `cdk synth --strict` passes for every stack
+- [ ] The aspect meta-test (§A.3) still rejects deliberately bad input
+- [ ] All nine KMS keys exist with rotation on, ARNs in SSM
+- [ ] VPC has zero public subnets, zero NAT gateways, zero internet gateways
+- [ ] Every interface endpoint has a policy with `aws:PrincipalAccount` + `aws:SecureTransport` conditions
+- [ ] Bedrock endpoint policy contains both `AllowAnthropicAndTitanEmbed` and `DenyEverythingElse` SIDs
+- [ ] `bedrock-reachability` post-deploy probe — all three sub-probes green
+- [ ] No `Resource: "*"` in any IAM statement outside `WILDCARD_EXCEPTION_SIDS`
+- [ ] Every Category B wildcard carries the required conditions per SPEC-59 §1.2
+- [ ] GuardDuty + Security Hub + CloudTrail + Config rule deployed and reporting
+- [ ] CI pipeline blocks PRs that violate any gate above
+
+When this list is fully checked, the foundation is real and Layer 2 (the pipeline) can begin per §3 of this spec.
+
+### A.10 Cost & Cleanup
+The throwaway account will accrue: VPC endpoints (~$0.01/hr each × ~12 endpoints ≈ $90/mo), GuardDuty (~$5–20/mo on light traffic), Security Hub (~$3/mo), OpenSearch Serverless (1 OCU minimum ≈ $175/mo).
+
+If pausing between Layer 1 and Layer 2 for more than a day, run `cdk destroy --all` on the throwaway account to avoid OpenSearch + endpoint charges. SSM-stored KMS ARNs vanish; the next bootstrap re-creates them.
